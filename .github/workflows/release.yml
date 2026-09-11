@@ -6,36 +6,12 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.id }}
+  release:
+    name: Build and publish release
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: macos-amd64
-            goos: darwin
-            goarch: amd64
-            extension: ""
-            archive: tar.gz
-          - id: macos-arm64
-            goos: darwin
-            goarch: arm64
-            extension: ""
-            archive: tar.gz
-          - id: windows-amd64
-            goos: windows
-            goarch: amd64
-            extension: .exe
-            archive: zip
-          - id: windows-arm64
-            goos: windows
-            goarch: arm64
-            extension: .exe
-            archive: zip
 
     steps:
       - name: Check out source
@@ -49,69 +25,78 @@ jobs:
 
       - name: Build and package
         shell: bash
-        env:
-          CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          FILE_EXTENSION: ${{ matrix.extension }}
-          ARCHIVE_FORMAT: ${{ matrix.archive }}
-          TARGET_ID: ${{ matrix.id }}
         run: |
           set -euo pipefail
 
           version="${GITHUB_REF_NAME#v}"
-          package="wireguard-go-${GITHUB_REF_NAME}-${TARGET_ID}"
-          package_dir="stage/${package}"
-
           printf 'package main\n\nconst Version = "%s"\n' "${version}" > version.go
-          mkdir -p "${package_dir}" dist
+          mkdir -p stage dist
 
-          go build \
-            -trimpath \
-            -ldflags="-s -w -buildid=" \
-            -o "${package_dir}/wireguard-go${FILE_EXTENSION}" \
-            .
+          wintun_version="0.14.1"
+          wintun_archive="stage/wintun-${wintun_version}.zip"
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --retry 3 \
+            --output "${wintun_archive}" \
+            "https://www.wintun.net/builds/wintun-${wintun_version}.zip"
+          echo "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51  ${wintun_archive}" | sha256sum --check
+          unzip -q "${wintun_archive}" -d stage/wintun-sdk
 
-          cp LICENSE README.md "${package_dir}/"
+          build_target() {
+            local target_id="$1"
+            local target_os="$2"
+            local target_arch="$3"
+            local extension="$4"
+            local archive_format="$5"
+            local package="wireguard-go-${GITHUB_REF_NAME}-${target_id}"
+            local package_dir="stage/${package}"
 
-          if [[ "${ARCHIVE_FORMAT}" == "zip" ]]; then
-            (
-              cd stage
-              zip -q -r "../dist/${package}.zip" "${package}"
-            )
-          else
-            tar -C stage -czf "dist/${package}.tar.gz" "${package}"
-          fi
+            mkdir -p "${package_dir}"
+            env \
+              CGO_ENABLED=0 \
+              GOOS="${target_os}" \
+              GOARCH="${target_arch}" \
+              go build \
+                -trimpath \
+                -ldflags="-s -w -buildid=" \
+                -o "${package_dir}/wireguard-go${extension}" \
+                .
 
-      - name: Upload package
-        uses: actions/upload-artifact@v4
-        with:
-          name: wireguard-go-${{ github.ref_name }}-${{ matrix.id }}
-          path: dist/*
-          if-no-files-found: error
+            cp LICENSE README.md "${package_dir}/"
 
-  release:
-    name: Publish GitHub release
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+            if [[ "${target_os}" == "windows" ]]; then
+              cp \
+                "stage/wintun-sdk/wintun/bin/${target_arch}/wintun.dll" \
+                "${package_dir}/wintun.dll"
+              cp \
+                stage/wintun-sdk/wintun/LICENSE.txt \
+                "${package_dir}/LICENSE.wintun.txt"
+            fi
 
-    steps:
-      - name: Download packages
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
+            if [[ "${archive_format}" == "zip" ]]; then
+              (
+                cd stage
+                zip -q -r "../dist/${package}.zip" "${package}"
+              )
+            else
+              tar -C stage -czf "dist/${package}.tar.gz" "${package}"
+            fi
+          }
 
-      - name: Generate checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          build_target macos-amd64 darwin amd64 "" tar.gz
+          build_target macos-arm64 darwin arm64 "" tar.gz
+          build_target windows-amd64 windows amd64 .exe zip
+          build_target windows-arm64 windows arm64 .exe zip
 
-      - name: Create or update release
+          (
+            cd dist
+            sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          )
+
+      - name: Create or update GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

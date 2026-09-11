@@ -34,6 +34,7 @@ const (
 
 func printUsage() {
 	fmt.Printf("Usage: %s [-f/--foreground] INTERFACE-NAME\n", os.Args[0])
+	fmt.Printf("       %s -c CONFIG-FILE\n", os.Args[0])
 }
 
 func warning() {
@@ -60,6 +61,13 @@ func warning() {
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
 		fmt.Printf("wireguard-go v%s\n\nUserspace WireGuard daemon for %s-%s.\nInformation available at https://www.wireguard.com.\nCopyright (C) Jason A. Donenfeld <Jason@zx2c4.com>.\n", Version, runtime.GOOS, runtime.GOARCH)
+		return
+	}
+	if len(os.Args) == 3 && os.Args[1] == "-c" {
+		if err := runConfig(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(ExitSetupFailed)
+		}
 		return
 	}
 

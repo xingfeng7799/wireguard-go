@@ -25,6 +25,13 @@ const (
 )
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "-c" {
+		if err := runConfig(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(ExitSetupFailed)
+		}
+		return
+	}
 	if len(os.Args) != 2 {
 		os.Exit(ExitSetupFailed)
 	}

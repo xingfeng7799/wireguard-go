@@ -22,6 +22,36 @@ When an interface is running, you may use [`wg(8)`](https://git.zx2c4.com/wiregu
 
 To run with more logging you may set the environment variable `LOG_LEVEL=debug`.
 
+### Configuration file client mode
+
+On macOS and Windows, `wireguard-go` can parse and run a WireGuard
+configuration directly, without `wg-quick`:
+
+```
+$ sudo wireguard-go -c /path/to/wg.conf
+```
+
+On Windows, run the equivalent command from an elevated Command Prompt or
+PowerShell window:
+
+```
+wireguard-go.exe -c C:\path\to\wg.conf
+```
+
+This mode runs in the foreground. Press Ctrl+C to stop the tunnel and restore
+the DNS settings and routes changed by the process. It supports `PrivateKey`,
+`ListenPort`, `Address`, `DNS`, and `MTU` in the `[Interface]` section, and
+`PublicKey`, `PresharedKey`, `Endpoint`, `AllowedIPs`, and
+`PersistentKeepalive` in `[Peer]` sections. Hook commands, `Table`, and
+`SaveConfig` are intentionally rejected instead of being silently ignored.
+
+The configuration file contains private key material and should be readable
+only by its owner, for example with `chmod 600 wg.conf`.
+
+Windows configuration mode uses the built-in Windows PowerShell networking
+cmdlets and requires administrator privileges. Keep the packaged `wintun.dll`
+in the same directory as `wireguard-go.exe`.
+
 ## Platforms
 
 ### Linux
