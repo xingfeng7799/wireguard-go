@@ -16,34 +16,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - id: linux-amd64
-            goos: linux
-            goarch: amd64
-          - id: linux-arm64
-            goos: linux
-            goarch: arm64
-          - id: linux-armv7
-            goos: linux
-            goarch: arm
-            goarm: "7"
-          - id: darwin-amd64
+          - id: macos-amd64
             goos: darwin
             goarch: amd64
-          - id: darwin-arm64
+            extension: ""
+            archive: tar.gz
+          - id: macos-arm64
             goos: darwin
             goarch: arm64
-          - id: freebsd-amd64
-            goos: freebsd
-            goarch: amd64
-          - id: freebsd-arm64
-            goos: freebsd
-            goarch: arm64
-          - id: openbsd-amd64
-            goos: openbsd
-            goarch: amd64
-          - id: openbsd-arm64
-            goos: openbsd
-            goarch: arm64
+            extension: ""
+            archive: tar.gz
           - id: windows-amd64
             goos: windows
             goarch: amd64
@@ -71,7 +53,6 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
           FILE_EXTENSION: ${{ matrix.extension }}
           ARCHIVE_FORMAT: ${{ matrix.archive }}
           TARGET_ID: ${{ matrix.id }}
