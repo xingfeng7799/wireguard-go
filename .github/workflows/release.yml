@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-amd64
+            goos: linux
+            goarch: amd64
+          - id: linux-arm64
+            goos: linux
+            goarch: arm64
+          - id: linux-armv7
+            goos: linux
+            goarch: arm
+            goarm: "7"
+          - id: darwin-amd64
+            goos: darwin
+            goarch: amd64
+          - id: darwin-arm64
+            goos: darwin
+            goarch: arm64
+          - id: freebsd-amd64
+            goos: freebsd
+            goarch: amd64
+          - id: freebsd-arm64
+            goos: freebsd
+            goarch: arm64
+          - id: openbsd-amd64
+            goos: openbsd
+            goarch: amd64
+          - id: openbsd-arm64
+            goos: openbsd
+            goarch: arm64
+          - id: windows-amd64
+            goos: windows
+            goarch: amd64
+            extension: .exe
+            archive: zip
+          - id: windows-arm64
+            goos: windows
+            goarch: arm64
+            extension: .exe
+            archive: zip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build and package
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          FILE_EXTENSION: ${{ matrix.extension }}
+          ARCHIVE_FORMAT: ${{ matrix.archive }}
+          TARGET_ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          package="wireguard-go-${GITHUB_REF_NAME}-${TARGET_ID}"
+          package_dir="stage/${package}"
+
+          printf 'package main\n\nconst Version = "%s"\n' "${version}" > version.go
+          mkdir -p "${package_dir}" dist
+
+          go build \
+            -trimpath \
+            -ldflags="-s -w -buildid=" \
+            -o "${package_dir}/wireguard-go${FILE_EXTENSION}" \
+            .
+
+          cp LICENSE README.md "${package_dir}/"
+
+          if [[ "${ARCHIVE_FORMAT}" == "zip" ]]; then
+            (
+              cd stage
+              zip -q -r "../dist/${package}.zip" "${package}"
+            )
+          else
+            tar -C stage -czf "dist/${package}.tar.gz" "${package}"
+          fi
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: wireguard-go-${{ github.ref_name }}-${{ matrix.id }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "${GITHUB_REF_NAME}"
+          fi
