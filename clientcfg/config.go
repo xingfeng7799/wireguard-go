@@ -13,7 +13,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -22,6 +21,15 @@ import (
 type Config struct {
 	Interface Interface
 	Peers     []Peer
+	IP4P      IP4P
+}
+
+type IP4P struct {
+	Mode      string
+	Provider  string
+	APIKey    string
+	APISecret string
+	ZoneID    string
 }
 
 type Interface struct {
@@ -45,6 +53,7 @@ func Parse(r io.Reader) (*Config, error) {
 	section := ""
 	peerIndex := -1
 	interfaceSeen := false
+	ip4pSeen := false
 	scanner := bufio.NewScanner(r)
 	for lineNumber := 1; scanner.Scan(); lineNumber++ {
 		line := strings.TrimSpace(stripComment(scanner.Text()))
@@ -62,6 +71,11 @@ func Parse(r io.Reader) (*Config, error) {
 			case "peer":
 				config.Peers = append(config.Peers, Peer{})
 				peerIndex = len(config.Peers) - 1
+			case "ip4p":
+				if ip4pSeen {
+					return nil, fmt.Errorf("line %d: duplicate IP4P section", lineNumber)
+				}
+				ip4pSeen = true
 			default:
 				return nil, fmt.Errorf("line %d: unknown section %q", lineNumber, section)
 			}
@@ -84,6 +98,8 @@ func Parse(r io.Reader) (*Config, error) {
 			} else {
 				err = parsePeer(&config.Peers[peerIndex], key, value)
 			}
+		case "ip4p":
+			err = parseIP4P(&config.IP4P, key, value)
 		default:
 			err = fmt.Errorf("setting appears before a section")
 		}
@@ -110,6 +126,9 @@ func Parse(r io.Reader) (*Config, error) {
 		if len(peer.AllowedIPs) == 0 {
 			return nil, fmt.Errorf("Peer %d: AllowedIPs is required", i+1)
 		}
+	}
+	if err := config.IP4P.validate(); err != nil {
+		return nil, err
 	}
 	return config, nil
 }
@@ -178,7 +197,7 @@ func parsePeer(peer *Peer, key, value string) error {
 		}
 		peer.PresharedKey = key
 	case "endpoint":
-		if _, _, err := net.SplitHostPort(value); err != nil {
+		if err := validateEndpointSyntax(value); err != nil {
 			return fmt.Errorf("invalid Endpoint %q: %w", value, err)
 		}
 		peer.Endpoint = value
@@ -196,6 +215,55 @@ func parsePeer(peer *Peer, key, value string) error {
 		peer.PersistentKeepalive = seconds
 	default:
 		return fmt.Errorf("unknown Peer setting %q", key)
+	}
+	return nil
+}
+
+func parseIP4P(config *IP4P, key, value string) error {
+	switch key {
+	case "mode":
+		config.Mode = strings.ToLower(value)
+	case "provider":
+		config.Provider = strings.ToLower(value)
+	case "apikey":
+		config.APIKey = value
+	case "apisecret":
+		config.APISecret = value
+	case "zoneid":
+		config.ZoneID = value
+	default:
+		return fmt.Errorf("unknown IP4P setting %q", key)
+	}
+	return nil
+}
+
+func (config *IP4P) validate() error {
+	if config.Mode != "" && config.Mode != "api" && config.Mode != "lookup_text" {
+		return fmt.Errorf("IP4P.Mode must be api or lookup_text, got %q", config.Mode)
+	}
+	if config.Mode == "api" && config.Provider == "" {
+		return fmt.Errorf("IP4P.Provider is required in api mode")
+	}
+	if config.Mode == "lookup_text" && (config.Provider != "" || config.APIKey != "" || config.APISecret != "" || config.ZoneID != "") {
+		return fmt.Errorf("IP4P provider credentials cannot be used in lookup_text mode")
+	}
+	if config.Provider == "" {
+		if config.APIKey != "" || config.APISecret != "" || config.ZoneID != "" {
+			return fmt.Errorf("IP4P.Provider is required when API credentials are configured")
+		}
+		return nil
+	}
+	switch config.Provider {
+	case "cloudflare":
+		if config.APIKey == "" || config.ZoneID == "" {
+			return fmt.Errorf("IP4P cloudflare requires APIKey and ZoneID")
+		}
+	case "tencent", "alibaba":
+		if config.APIKey == "" || config.APISecret == "" {
+			return fmt.Errorf("IP4P %s requires APIKey and APISecret", config.Provider)
+		}
+	default:
+		return fmt.Errorf("unsupported IP4P.Provider %q", config.Provider)
 	}
 	return nil
 }
@@ -238,24 +306,6 @@ func keyToHex(value string) (string, error) {
 		return "", fmt.Errorf("key has %d bytes instead of 32", len(key))
 	}
 	return hex.EncodeToString(key), nil
-}
-
-func (config *Config) ResolveEndpoints() error {
-	for i := range config.Peers {
-		peer := &config.Peers[i]
-		if peer.Endpoint == "" {
-			continue
-		}
-		address, err := net.ResolveUDPAddr("udp", peer.Endpoint)
-		if err != nil {
-			return fmt.Errorf("Peer %d: resolve Endpoint %q: %w", i+1, peer.Endpoint, err)
-		}
-		if address.IP == nil {
-			return fmt.Errorf("Peer %d: Endpoint %q resolved without an IP address", i+1, peer.Endpoint)
-		}
-		peer.Endpoint = net.JoinHostPort(address.IP.String(), strconv.Itoa(address.Port))
-	}
-	return nil
 }
 
 func (config *Config) UAPI() string {

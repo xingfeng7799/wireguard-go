@@ -82,3 +82,47 @@ Address = 10.0.0.2/32
 		t.Fatalf("expected private key error, got %v", err)
 	}
 }
+
+func TestParseIP4PProvider(t *testing.T) {
+	input := `[Interface]
+PrivateKey = ` + testKey(1) + `
+Address = 10.0.0.2/32
+
+[Peer]
+PublicKey = ` + testKey(2) + `
+AllowedIPs = 0.0.0.0/0
+Endpoint = ip4p.example.com
+
+[IP4P]
+Mode = api
+Provider = Cloudflare
+APIKey = test-token
+ZoneID = test-zone
+`
+	config, err := Parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.IP4P.Mode != "api" || config.IP4P.Provider != "cloudflare" || config.IP4P.APIKey != "test-token" || config.IP4P.ZoneID != "test-zone" {
+		t.Fatalf("unexpected IP4P configuration: %#v", config.IP4P)
+	}
+}
+
+func TestRejectsIncompleteIP4PProvider(t *testing.T) {
+	input := `[Interface]
+PrivateKey = ` + testKey(1) + `
+Address = 10.0.0.2/32
+
+[Peer]
+PublicKey = ` + testKey(2) + `
+AllowedIPs = 0.0.0.0/0
+
+[IP4P]
+Provider = tencent
+APIKey = secret-id
+`
+	_, err := Parse(strings.NewReader(input))
+	if err == nil || !strings.Contains(err.Error(), "APISecret") {
+		t.Fatalf("expected missing APISecret error, got %v", err)
+	}
+}
