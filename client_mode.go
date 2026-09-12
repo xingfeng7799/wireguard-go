@@ -44,6 +44,7 @@ func runConfig(configPath string) error {
 	if err := config.ResolveEndpoints(); err != nil {
 		return err
 	}
+	printEndpointResolutions(config)
 
 	mtu := config.Interface.MTU
 	if mtu == 0 {
@@ -91,6 +92,35 @@ func runConfig(configPath string) error {
 	}
 	fmt.Printf("Stopping WireGuard interface %s\n", interfaceName)
 	return nil
+}
+
+func printEndpointResolutions(config *clientcfg.Config) {
+	switch {
+	case config.IP4P.Provider != "":
+		fmt.Printf("Endpoint resolution mode: api (provider: %s)\n", config.IP4P.Provider)
+	case config.IP4P.Mode == "lookup_text" || usesIP4PLookup(config.EndpointResolutions):
+		fmt.Println("Endpoint resolution mode: lookup_text (system DNS)")
+	default:
+		fmt.Println("Endpoint resolution mode: standard")
+	}
+	for _, resolution := range config.EndpointResolutions {
+		fmt.Printf(
+			"Peer %d endpoint [%s]: %s -> %s\n",
+			resolution.Peer,
+			resolution.Method,
+			resolution.Original,
+			resolution.Resolved,
+		)
+	}
+}
+
+func usesIP4PLookup(resolutions []clientcfg.EndpointResolution) bool {
+	for _, resolution := range resolutions {
+		if resolution.Method != clientcfg.EndpointMethodStandard {
+			return true
+		}
+	}
+	return false
 }
 
 func configLogLevel() int {

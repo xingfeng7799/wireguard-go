@@ -19,9 +19,17 @@ import (
 )
 
 type Config struct {
-	Interface Interface
-	Peers     []Peer
-	IP4P      IP4P
+	Interface           Interface
+	Peers               []Peer
+	IP4P                IP4P
+	EndpointResolutions []EndpointResolution
+}
+
+type EndpointResolution struct {
+	Peer     int
+	Original string
+	Resolved string
+	Method   string
 }
 
 type IP4P struct {

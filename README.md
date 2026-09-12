@@ -115,6 +115,8 @@ printf '%s' '[2001:db8::9]:51820' | base64
 
 未启用 API 模式时，带显式端口的 Endpoint 保持原有 WireGuard 解析行为。Endpoint 会在客户端启动时解析；DNS 记录发生变化后，需要重启客户端才能获取新地址。
 
+启动时会输出 Endpoint 解析模式、使用的 DNS 服务商、原始域名，以及最终解析得到的 IP 和端口。如需同时查看 WireGuard 设备的详细调试日志，可以设置 `LOG_LEVEL=debug`。
+
 ### DNS 服务商 API 模式
 
 如果希望绕过本机 DNS、直接通过 DNS 服务商 API 读取 TXT 记录，可以在配置文件中增加全局 `[IP4P]` 配置段。

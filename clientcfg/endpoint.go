@@ -15,6 +15,12 @@ import (
 
 const endpointLookupTimeout = 10 * time.Second
 
+const (
+	EndpointMethodStandard = "standard"
+	EndpointMethodDNSTXT   = "DNS TXT"
+	EndpointMethodIP4PAAAA = "IP4P AAAA"
+)
+
 type endpointResolver interface {
 	LookupIP(context.Context, string, string) ([]net.IP, error)
 	LookupTXT(context.Context, string) ([]string, error)
@@ -44,23 +50,36 @@ func (config *Config) ResolveEndpoints() error {
 	if err != nil {
 		return err
 	}
+	config.EndpointResolutions = config.EndpointResolutions[:0]
 	for i := range config.Peers {
 		peer := &config.Peers[i]
 		if peer.Endpoint == "" {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), endpointLookupTimeout)
-		endpoint, err := resolveEndpoint(ctx, net.DefaultResolver, provider, peer.Endpoint)
+		original := peer.Endpoint
+		endpoint, method, err := resolveEndpointDetailed(ctx, net.DefaultResolver, provider, original)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("Peer %d: resolve Endpoint %q: %w", i+1, peer.Endpoint, err)
 		}
 		peer.Endpoint = endpoint
+		config.EndpointResolutions = append(config.EndpointResolutions, EndpointResolution{
+			Peer:     i + 1,
+			Original: original,
+			Resolved: endpoint,
+			Method:   method,
+		})
 	}
 	return nil
 }
 
 func resolveEndpoint(ctx context.Context, resolver endpointResolver, provider txtProvider, endpoint string) (string, error) {
+	resolved, _, err := resolveEndpointDetailed(ctx, resolver, provider, endpoint)
+	return resolved, err
+}
+
+func resolveEndpointDetailed(ctx context.Context, resolver endpointResolver, provider txtProvider, endpoint string) (string, string, error) {
 	host, portText, err := net.SplitHostPort(endpoint)
 	if err == nil {
 		if _, parseErr := netip.ParseAddr(host); provider != nil && parseErr != nil {
@@ -68,29 +87,30 @@ func resolveEndpoint(ctx context.Context, resolver endpointResolver, provider tx
 		}
 		port, err := lookupUDPPort(portText)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
-		return resolveHostPort(ctx, resolver, host, port)
+		resolved, err := resolveHostPort(ctx, resolver, host, port)
+		return resolved, EndpointMethodStandard, err
 	}
 	return resolveIP4PEndpoint(ctx, resolver, provider, endpoint)
 }
 
-func resolveIP4PEndpoint(ctx context.Context, resolver endpointResolver, provider txtProvider, hostname string) (string, error) {
+func resolveIP4PEndpoint(ctx context.Context, resolver endpointResolver, provider txtProvider, hostname string) (string, string, error) {
 	if provider != nil {
 		records, err := provider.GetTXTRecords(ctx, hostname)
 		if err != nil {
-			return "", fmt.Errorf("IP4P %s API lookup failed: %w", provider.Name(), err)
+			return "", "", fmt.Errorf("IP4P %s API lookup failed: %w", provider.Name(), err)
 		}
 		if endpoint, ok := endpointFromTXTRecords(ctx, resolver, records); ok {
-			return endpoint, nil
+			return endpoint, provider.Name() + " API TXT", nil
 		}
-		return "", fmt.Errorf("IP4P %s API returned no valid TXT endpoint", provider.Name())
+		return "", "", fmt.Errorf("IP4P %s API returned no valid TXT endpoint", provider.Name())
 	}
 
 	records, txtErr := resolver.LookupTXT(ctx, hostname)
 	if txtErr == nil {
 		if endpoint, ok := endpointFromTXTRecords(ctx, resolver, records); ok {
-			return endpoint, nil
+			return endpoint, EndpointMethodDNSTXT, nil
 		}
 	}
 
@@ -103,14 +123,14 @@ func resolveIP4PEndpoint(ctx context.Context, resolver endpointResolver, provide
 			}
 			address := netip.AddrFrom4([4]byte{bytes[12], bytes[13], bytes[14], bytes[15]})
 			port := int(bytes[10])<<8 | int(bytes[11])
-			return net.JoinHostPort(address.String(), strconv.Itoa(port)), nil
+			return net.JoinHostPort(address.String(), strconv.Itoa(port)), EndpointMethodIP4PAAAA, nil
 		}
 	}
 
 	if txtErr != nil && ip6Err != nil {
-		return "", fmt.Errorf("IP4P TXT lookup failed (%v) and AAAA lookup failed (%v)", txtErr, ip6Err)
+		return "", "", fmt.Errorf("IP4P TXT lookup failed (%v) and AAAA lookup failed (%v)", txtErr, ip6Err)
 	}
-	return "", fmt.Errorf("hostname has no valid IP4P TXT or encoded AAAA record")
+	return "", "", fmt.Errorf("hostname has no valid IP4P TXT or encoded AAAA record")
 }
 
 func endpointFromTXTRecords(ctx context.Context, resolver endpointResolver, records []string) (string, bool) {
