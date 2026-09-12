@@ -50,6 +50,20 @@ wireguard-go.exe -c C:\path\to\wg.conf
 
 该模式会保持前台运行。按 `Ctrl+C` 可以停止隧道，并恢复程序修改过的 DNS、路由、地址和 MTU。
 
+启动前可以执行只读配置检查，不需要管理员权限，也不会创建 TUN、修改路由或覆盖 DNS：
+
+```shell
+wireguard-go --check /path/to/wg.conf
+```
+
+Windows：
+
+```powershell
+wireguard-go.exe --check C:\path\to\wg.conf
+```
+
+检查会验证配置语法和密钥、解析 Endpoint，并输出接口地址、peer 数量、IPv4/IPv6 全隧道状态、DNS 覆盖状态和 Endpoint 自动刷新周期。如果 `AllowedIPs` 包含默认路由，或配置会覆盖系统 DNS，还会提示与代理软件、其他 TUN/VPN 及 Fake-IP DNS 发生冲突的风险。配置文件包含服务商 API 参数时，检查过程会实际调用相应 API，但不会修改本机网络。
+
 `[Interface]` 支持以下字段：
 
 - `PrivateKey`
@@ -75,6 +89,67 @@ chmod 600 wg.conf
 ```
 
 Windows 客户端模式使用系统自带的 Windows PowerShell 网络管理命令，因此需要管理员权限。发布包中的 `wintun.dll` 必须和 `wireguard-go.exe` 放在同一个目录。
+
+### 代理共存与高级路由
+
+当 `AllowedIPs` 包含 `0.0.0.0/0` 或 `::/0` 时，WireGuard 会接管对应地址族的全部流量。代理软件的远端服务器也可能被送入 WireGuard，代理自己的 TUN 路由或 Fake-IP DNS 还可能与 WireGuard 冲突。可以通过全局 `[Routing]` 配置段让代理服务器、本地网络或其他目标绕过 WireGuard：
+
+```ini
+[Peer]
+AllowedIPs = 0.0.0.0/0, ::/0
+
+[Routing]
+Mode = split
+ExcludeIPs = 192.168.0.0/16, 203.0.113.20/32
+ExcludeDomains = proxy.example.com, api.example.com
+RefreshInterval = 60
+```
+
+ 配置示例：
+
+  [Peer]
+  AllowedIPs = 0.0.0.0/0, ::/0
+
+  [Routing]
+  Mode = split
+  ExcludeIPs = 192.168.0.0/16, 203.0.113.20/32
+  ExcludeDomains = proxy.example.com, api.example.com
+  RefreshInterval = 60
+
+
+
+支持的字段：
+
+- `Mode = full|split`
+  - `full` 表示 `AllowedIPs` 中必须至少包含一个 IPv4 或 IPv6 默认路由。
+  - `split` 可以配合普通的非默认 `AllowedIPs` 使用；也可以在全隧道配置中配合 `ExcludeIPs` 或 `ExcludeDomains`，表示“除排除目标外全部进入 WireGuard”。
+  - 未填写时，程序根据 `AllowedIPs` 自动判断。
+- `ExcludeIPs`：需要走原网络出口的 IPv4/IPv6 地址或网段，支持逗号分隔和重复配置。
+    - 支持 IPv4、IPv6、单个地址和网段
+    - 让目标通过原网络出口访问
+- `ExcludeDomains`：需要走原网络出口的域名，支持逗号分隔和重复配置。启动时解析该域名返回的全部 IPv4/IPv6 地址，并为每个地址建立主机路由。
+    - 启动时解析全部 IPv4/IPv6
+    - 自动添加直连主机路由
+- `RefreshInterval`：重新解析 `ExcludeDomains` 的周期，单位为秒，默认为 `60`，最大为 `86400`，设置为 `0` 可关闭刷新。
+  - 域名地址默认每 60 秒刷新
+- 地址改变时先添加新路由，再删除旧路由
+- DNS 失败时保留上一次有效地址
+- 与 WireGuard Endpoint 保护路由共享状态，避免误删
+- 自动保存启动前的 IPv4/IPv6 出口
+- 只删除程序自己创建的路由
+- 退出时自动恢复
+- --check 会输出分流模式和最终解析地址
+- 支持重复配置自动去重
+
+客户端会在添加 WireGuard 路由前记录原来的 IPv4/IPv6 网络出口，并先添加排除路由。域名解析结果发生变化时，先保护新地址，再移除不再使用的旧地址；刷新失败时继续保留上一次成功的结果。程序只删除自己创建的路由，退出时自动清理。
+
+如果代理服务器使用域名，推荐同时配置 `ExcludeDomains`，不要只把当前解析到的 IP 写进 `ExcludeIPs`。如果代理软件依赖 Fake-IP 或自己的加密 DNS，还应考虑删除 WireGuard 配置中的 `DNS`，避免客户端覆盖代理的 DNS 设置。
+
+可先运行以下命令确认最终解析地址和分流模式：
+
+```shell
+wireguard-go --check wg.conf
+```
 
 ### Endpoint 配置
 

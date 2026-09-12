@@ -24,6 +24,12 @@ const (
 	ExitSetupFailed  = 1
 )
 
+func printUsage() {
+	fmt.Printf("Usage: %s INTERFACE-NAME\n", os.Args[0])
+	fmt.Printf("       %s -c CONFIG-FILE\n", os.Args[0])
+	fmt.Printf("       %s --check CONFIG-FILE\n", os.Args[0])
+}
+
 func main() {
 	if len(os.Args) == 3 && os.Args[1] == "-c" {
 		if err := runConfig(os.Args[2]); err != nil {
@@ -32,7 +38,15 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) == 3 && os.Args[1] == "--check" {
+		if err := checkConfig(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(ExitSetupFailed)
+		}
+		return
+	}
 	if len(os.Args) != 2 {
+		printUsage()
 		os.Exit(ExitSetupFailed)
 	}
 	interfaceName := os.Args[1]

@@ -30,6 +30,7 @@ type darwinRoute struct {
 	family   string
 	target   string
 	endpoint bool
+	bypass   bool
 }
 
 type darwinEgress struct {
@@ -56,6 +57,10 @@ func configureClientNetwork(interfaceName string, config *clientcfg.Config) (cli
 		return nil, err
 	}
 	state.cacheMissingEndpointEgress()
+	if err := state.configureBypassRoutes(config.RoutingBypassPrefixes(), config.AllowedIPs()); err != nil {
+		state.Close()
+		return nil, err
+	}
 	if err := state.configureAllowedRoutes(config.AllowedIPs()); err != nil {
 		state.Close()
 		return nil, err
@@ -136,8 +141,9 @@ func (state *darwinNetworkState) ensureEndpointRoute(endpoint netip.Addr, allowe
 	if !prefixesContain(allowed, endpoint) {
 		return nil
 	}
-	for _, route := range state.routes {
-		if route.endpoint && route.family == family && route.target == endpoint.String() {
+	for i := range state.routes {
+		if state.routes[i].family == family && state.routes[i].target == endpoint.String() {
+			state.routes[i].endpoint = true
 			return nil
 		}
 	}
@@ -149,10 +155,13 @@ func (state *darwinNetworkState) ensureEndpointRoute(endpoint netip.Addr, allowe
 	} else {
 		return fmt.Errorf("external route for endpoint %s has no gateway or interface", endpoint)
 	}
-	if err := runDarwinCommand("/sbin/route", args...); err != nil {
+	added, err := addDarwinRoute(args...)
+	if err != nil {
 		return err
 	}
-	state.routes = append(state.routes, darwinRoute{family: family, target: endpoint.String(), endpoint: true})
+	if added {
+		state.routes = append(state.routes, darwinRoute{family: family, target: endpoint.String(), endpoint: true})
+	}
 	return nil
 }
 
@@ -165,7 +174,77 @@ func (state *darwinNetworkState) RemoveEndpointRoute(endpoint netip.Addr) error 
 		if !route.endpoint || route.family != family || route.target != target {
 			continue
 		}
+		state.routes[i].endpoint = false
+		if state.routes[i].bypass {
+			return nil
+		}
 		if err := runDarwinCommand("/sbin/route", "-q", "-n", "delete", family, target); err != nil {
+			state.routes[i].endpoint = true
+			return err
+		}
+		state.routes = append(state.routes[:i], state.routes[i+1:]...)
+		return nil
+	}
+	return nil
+}
+
+func (state *darwinNetworkState) configureBypassRoutes(prefixes, allowed []netip.Prefix) error {
+	for _, prefix := range prefixes {
+		if err := state.EnsureBypassRoute(prefix, allowed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (state *darwinNetworkState) EnsureBypassRoute(prefix netip.Prefix, allowed []netip.Prefix) error {
+	prefix = prefix.Masked()
+	if !prefixesOverlap(allowed, prefix) {
+		return nil
+	}
+	family := routeFamily(prefix.Addr())
+	egress, ok := state.endpointEgress[family]
+	if !ok {
+		return fmt.Errorf("no external %s route is available for bypass %s", family, prefix)
+	}
+	for i := range state.routes {
+		if state.routes[i].family == family && state.routes[i].target == prefix.String() {
+			state.routes[i].bypass = true
+			return nil
+		}
+	}
+	args := []string{"-q", "-n", "add", family, prefix.String()}
+	if egress.gateway != "" {
+		args = append(args, "-gateway", egress.gateway)
+	} else if egress.iface != "" {
+		args = append(args, "-interface", egress.iface)
+	} else {
+		return fmt.Errorf("external route for bypass %s has no gateway or interface", prefix)
+	}
+	added, err := addDarwinRoute(args...)
+	if err != nil {
+		return err
+	}
+	if added {
+		state.routes = append(state.routes, darwinRoute{family: family, target: prefix.String(), bypass: true})
+	}
+	return nil
+}
+
+func (state *darwinNetworkState) RemoveBypassRoute(prefix netip.Prefix) error {
+	prefix = prefix.Masked()
+	family := routeFamily(prefix.Addr())
+	for i := len(state.routes) - 1; i >= 0; i-- {
+		route := state.routes[i]
+		if !route.bypass || route.family != family || route.target != prefix.String() {
+			continue
+		}
+		state.routes[i].bypass = false
+		if state.routes[i].endpoint {
+			return nil
+		}
+		if err := runDarwinCommand("/sbin/route", "-q", "-n", "delete", family, prefix.String()); err != nil {
+			state.routes[i].bypass = true
 			return err
 		}
 		state.routes = append(state.routes[:i], state.routes[i+1:]...)
@@ -278,6 +357,20 @@ func runDarwinCommand(path string, args ...string) error {
 		return fmt.Errorf("%s %s: %w: %s", path, strings.Join(args, " "), err, strings.TrimSpace(output.String()))
 	}
 	return nil
+}
+
+func addDarwinRoute(args ...string) (bool, error) {
+	command := exec.Command("/sbin/route", args...)
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Run(); err != nil {
+		if strings.Contains(strings.ToLower(output.String()), "file exists") {
+			return false, nil
+		}
+		return false, fmt.Errorf("/sbin/route %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(output.String()))
+	}
+	return true, nil
 }
 
 func (state *darwinNetworkState) Close() error {

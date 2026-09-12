@@ -141,3 +141,52 @@ APIKey = secret-id
 		t.Fatalf("expected missing APISecret error, got %v", err)
 	}
 }
+
+func TestParseRoutingExclusions(t *testing.T) {
+	input := `[Interface]
+PrivateKey = ` + testKey(1) + `
+Address = 10.0.0.2/32
+
+[Peer]
+PublicKey = ` + testKey(2) + `
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 192.0.2.1:51820
+
+[Routing]
+Mode = split
+ExcludeIPs = 192.168.0.0/16, 203.0.113.10/32
+ExcludeDomains = proxy.example.com, API.EXAMPLE.COM.
+RefreshInterval = 30
+`
+	config, err := Parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.EffectiveRoutingMode() != "split" || len(config.Routing.ExcludeIPs) != 2 {
+		t.Fatalf("unexpected routing config: %#v", config.Routing)
+	}
+	if got := strings.Join(config.Routing.ExcludeDomains, ","); got != "proxy.example.com,api.example.com" {
+		t.Fatalf("exclude domains = %q", got)
+	}
+	if config.RoutingRefreshInterval() != 30*time.Second {
+		t.Fatalf("routing refresh interval = %s", config.RoutingRefreshInterval())
+	}
+}
+
+func TestRejectsSplitDefaultWithoutExclusions(t *testing.T) {
+	input := `[Interface]
+PrivateKey = ` + testKey(1) + `
+Address = 10.0.0.2/32
+
+[Peer]
+PublicKey = ` + testKey(2) + `
+AllowedIPs = 0.0.0.0/0
+
+[Routing]
+Mode = split
+`
+	_, err := Parse(strings.NewReader(input))
+	if err == nil || !strings.Contains(err.Error(), "requires ExcludeIPs or ExcludeDomains") {
+		t.Fatalf("expected split routing validation error, got %v", err)
+	}
+}

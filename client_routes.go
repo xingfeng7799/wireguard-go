@@ -13,6 +13,18 @@ func prefixesContain(prefixes []netip.Prefix, address netip.Addr) bool {
 	return false
 }
 
+func prefixesOverlap(prefixes []netip.Prefix, candidate netip.Prefix) bool {
+	candidate = candidate.Masked()
+	for _, prefix := range prefixes {
+		prefix = prefix.Masked()
+		if prefix.Addr().BitLen() == candidate.Addr().BitLen() &&
+			(prefix.Contains(candidate.Addr()) || candidate.Contains(prefix.Addr())) {
+			return true
+		}
+	}
+	return false
+}
+
 func splitDefaultRoute(prefix netip.Prefix) []netip.Prefix {
 	if prefix.Bits() != 0 {
 		return []netip.Prefix{prefix}
