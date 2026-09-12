@@ -24,6 +24,7 @@ import (
 type windowsNetworkState struct {
 	interfaceIndex int
 	routes         []windowsRoute
+	endpointEgress map[string]windowsEgress
 	addresses      []netip.Prefix
 	dnsServers     []string
 	dnsChanged     bool
@@ -32,6 +33,12 @@ type windowsNetworkState struct {
 
 type windowsRoute struct {
 	destination    string
+	interfaceIndex int
+	nextHop        string
+	endpoint       bool
+}
+
+type windowsEgress struct {
 	interfaceIndex int
 	nextHop        string
 }
@@ -64,7 +71,10 @@ func configureClientNetwork(interfaceName string, config *clientcfg.Config) (cli
 	if err != nil {
 		return nil, err
 	}
-	state := &windowsNetworkState{interfaceIndex: interfaceIndex}
+	state := &windowsNetworkState{
+		interfaceIndex: interfaceIndex,
+		endpointEgress: make(map[string]windowsEgress),
+	}
 	fail := func(err error) (clientNetworkState, error) {
 		if cleanupErr := state.Close(); cleanupErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("roll back partial Windows network configuration: %w", cleanupErr))
@@ -78,6 +88,7 @@ func configureClientNetwork(interfaceName string, config *clientcfg.Config) (cli
 	if err := state.configureEndpointRoutes(config.EndpointIPs(), config.AllowedIPs()); err != nil {
 		return fail(err)
 	}
+	state.cacheMissingEndpointEgress()
 	if err := state.configureAddresses(config.Interface.Addresses); err != nil {
 		return fail(err)
 	}
@@ -88,6 +99,19 @@ func configureClientNetwork(interfaceName string, config *clientcfg.Config) (cli
 		return fail(err)
 	}
 	return state, nil
+}
+
+func (state *windowsNetworkState) cacheMissingEndpointEgress() {
+	for _, probe := range []netip.Addr{
+		netip.MustParseAddr("1.1.1.1"),
+		netip.MustParseAddr("2606:4700:4700::1111"),
+	} {
+		if _, ok := state.endpointEgress[windowsAddressFamily(probe)]; ok {
+			continue
+		}
+		// A missing address family is valid on hosts without that connectivity.
+		_ = state.ensureEndpointRoute(probe, nil, true)
+	}
 }
 
 func findWindowsInterfaceIndex(interfaceName string) (int, error) {
@@ -157,10 +181,25 @@ func (state *windowsNetworkState) configureInterface(configuredMTU int) error {
 func (state *windowsNetworkState) configureEndpointRoutes(endpoints []netip.Addr, allowed []netip.Prefix) error {
 	seen := make(map[netip.Addr]bool)
 	for _, endpoint := range endpoints {
-		if seen[endpoint] || !prefixesContain(allowed, endpoint) {
+		if seen[endpoint] {
 			continue
 		}
 		seen[endpoint] = true
+		if err := state.ensureEndpointRoute(endpoint, allowed, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (state *windowsNetworkState) EnsureEndpointRoute(endpoint netip.Addr, allowed []netip.Prefix) error {
+	return state.ensureEndpointRoute(endpoint.Unmap(), allowed, false)
+}
+
+func (state *windowsNetworkState) ensureEndpointRoute(endpoint netip.Addr, allowed []netip.Prefix, initial bool) error {
+	family := windowsAddressFamily(endpoint)
+	egress, ok := state.endpointEgress[family]
+	if !ok {
 		lookupScript := fmt.Sprintf(
 			"$route = Find-NetRoute -RemoteIPAddress %s -ErrorAction Stop | Where-Object { $_.PSObject.Properties.Name -contains 'DestinationPrefix' } | Select-Object -First 1; if ($null -eq $route) { throw 'No route returned' }; '{0}|{1}|{2}' -f $route.DestinationPrefix,$route.InterfaceIndex,$route.NextHop",
 			quotePowerShell(endpoint.String()),
@@ -173,26 +212,57 @@ func (state *windowsNetworkState) configureEndpointRoutes(endpoints []netip.Addr
 		if len(parts) != 3 {
 			return fmt.Errorf("parse existing route for endpoint %s: %q", endpoint, output)
 		}
-		prefix := netip.PrefixFrom(endpoint, endpoint.BitLen()).String()
-		if strings.EqualFold(parts[0], prefix) {
-			continue
-		}
 		interfaceIndex, err := strconv.Atoi(parts[1])
 		if err != nil || interfaceIndex <= 0 || strings.TrimSpace(parts[2]) == "" {
 			return fmt.Errorf("invalid existing route for endpoint %s: %q", endpoint, output)
 		}
-		nextHop := strings.TrimSpace(parts[2])
-		added, err := addWindowsRoute(prefix, interfaceIndex, nextHop)
-		if err != nil {
-			return fmt.Errorf("pin route for endpoint %s: %w", endpoint, err)
+		if !initial && interfaceIndex == state.interfaceIndex {
+			return fmt.Errorf("cannot determine external route for new %s endpoint after tunnel routes are active", family)
 		}
-		if added {
-			state.routes = append(state.routes, windowsRoute{
-				destination:    prefix,
-				interfaceIndex: interfaceIndex,
-				nextHop:        nextHop,
-			})
+		egress = windowsEgress{interfaceIndex: interfaceIndex, nextHop: strings.TrimSpace(parts[2])}
+		state.endpointEgress[family] = egress
+	}
+	if !prefixesContain(allowed, endpoint) {
+		return nil
+	}
+	prefix := netip.PrefixFrom(endpoint, endpoint.BitLen()).String()
+	for _, route := range state.routes {
+		if route.endpoint && strings.EqualFold(route.destination, prefix) {
+			return nil
 		}
+	}
+	added, err := addWindowsRoute(prefix, egress.interfaceIndex, egress.nextHop)
+	if err != nil {
+		return fmt.Errorf("pin route for endpoint %s: %w", endpoint, err)
+	}
+	if added {
+		state.routes = append(state.routes, windowsRoute{
+			destination:    prefix,
+			interfaceIndex: egress.interfaceIndex,
+			nextHop:        egress.nextHop,
+			endpoint:       true,
+		})
+	}
+	return nil
+}
+
+func (state *windowsNetworkState) RemoveEndpointRoute(endpoint netip.Addr) error {
+	endpoint = endpoint.Unmap()
+	prefix := netip.PrefixFrom(endpoint, endpoint.BitLen()).String()
+	for i := len(state.routes) - 1; i >= 0; i-- {
+		route := state.routes[i]
+		if !route.endpoint || !strings.EqualFold(route.destination, prefix) {
+			continue
+		}
+		script := fmt.Sprintf(
+			"Get-NetRoute -DestinationPrefix %s -InterfaceIndex %d -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq %s } | Remove-NetRoute -Confirm:$false -ErrorAction Stop",
+			quotePowerShell(route.destination), route.interfaceIndex, quotePowerShell(route.nextHop),
+		)
+		if _, err := runPowerShell(script); err != nil {
+			return fmt.Errorf("remove Windows endpoint route %s: %w", route.destination, err)
+		}
+		state.routes = append(state.routes[:i], state.routes[i+1:]...)
+		return nil
 	}
 	return nil
 }

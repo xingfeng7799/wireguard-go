@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testKey(value byte) string {
@@ -98,6 +99,7 @@ Mode = api
 Provider = Cloudflare
 APIKey = test-token
 ZoneID = test-zone
+RefreshInterval = 30
 `
 	config, err := Parse(strings.NewReader(input))
 	if err != nil {
@@ -105,6 +107,19 @@ ZoneID = test-zone
 	}
 	if config.IP4P.Mode != "api" || config.IP4P.Provider != "cloudflare" || config.IP4P.APIKey != "test-token" || config.IP4P.ZoneID != "test-zone" {
 		t.Fatalf("unexpected IP4P configuration: %#v", config.IP4P)
+	}
+	if config.EndpointRefreshInterval() != 30*time.Second {
+		t.Fatalf("refresh interval = %s", config.EndpointRefreshInterval())
+	}
+}
+
+func TestEndpointRefreshIntervalDefaultsAndDisable(t *testing.T) {
+	if got := (&Config{}).EndpointRefreshInterval(); got != 60*time.Second {
+		t.Fatalf("default refresh interval = %s", got)
+	}
+	config := &Config{IP4P: IP4P{refreshIntervalSet: true}}
+	if got := config.EndpointRefreshInterval(); got != 0 {
+		t.Fatalf("disabled refresh interval = %s", got)
 	}
 }
 

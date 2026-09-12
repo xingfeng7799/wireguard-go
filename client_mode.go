@@ -7,8 +7,10 @@ package main
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"os/signal"
+	"time"
 
 	"golang.zx2c4.com/wireguard/clientcfg"
 	"golang.zx2c4.com/wireguard/conn"
@@ -17,6 +19,8 @@ import (
 )
 
 type clientNetworkState interface {
+	EnsureEndpointRoute(netip.Addr, []netip.Prefix) error
+	RemoveEndpointRoute(netip.Addr) error
 	Close() error
 }
 
@@ -83,15 +87,99 @@ func runConfig(configPath string) error {
 	logger.Verbosef("Client started from %s", configPath)
 	fmt.Printf("WireGuard interface %s is up; press Ctrl+C to stop\n", interfaceName)
 
+	var refreshTimer *time.Ticker
+	var refresh <-chan time.Time
+	if usesIP4PLookup(config.EndpointResolutions) {
+		if interval := config.EndpointRefreshInterval(); interval > 0 {
+			refreshTimer = time.NewTicker(interval)
+			refresh = refreshTimer.C
+			defer refreshTimer.Stop()
+			fmt.Printf("Endpoint auto-refresh: every %s\n", interval)
+		} else {
+			fmt.Println("Endpoint auto-refresh: disabled")
+		}
+	}
+
 	terminated := make(chan os.Signal, 1)
 	signal.Notify(terminated, clientTerminationSignals()...)
 	defer signal.Stop(terminated)
-	select {
-	case <-terminated:
-	case <-wgDevice.Wait():
+	for {
+		select {
+		case <-terminated:
+			fmt.Printf("Stopping WireGuard interface %s\n", interfaceName)
+			return nil
+		case <-wgDevice.Wait():
+			fmt.Printf("Stopping WireGuard interface %s\n", interfaceName)
+			return nil
+		case <-refresh:
+			refreshClientEndpoints(config, networkState, wgDevice)
+		}
 	}
-	fmt.Printf("Stopping WireGuard interface %s\n", interfaceName)
-	return nil
+}
+
+func refreshClientEndpoints(config *clientcfg.Config, networkState clientNetworkState, wgDevice *device.Device) {
+	candidates, lookupErrors := config.RefreshEndpointResolutions()
+	for _, err := range lookupErrors {
+		fmt.Fprintf(os.Stderr, "Endpoint refresh failed: %v\n", err)
+	}
+	for _, candidate := range candidates {
+		peerIndex := candidate.Peer - 1
+		if peerIndex < 0 || peerIndex >= len(config.Peers) {
+			fmt.Fprintf(os.Stderr, "Endpoint refresh failed: invalid peer number %d\n", candidate.Peer)
+			continue
+		}
+		oldEndpoint := config.Peers[peerIndex].Endpoint
+		if candidate.Resolved == oldEndpoint {
+			continue
+		}
+		oldAddress, oldErr := netip.ParseAddrPort(oldEndpoint)
+		newAddress, newErr := netip.ParseAddrPort(candidate.Resolved)
+		if oldErr != nil || newErr != nil {
+			fmt.Fprintf(os.Stderr, "Endpoint refresh failed for Peer %d: invalid resolved endpoint %q -> %q\n", candidate.Peer, oldEndpoint, candidate.Resolved)
+			continue
+		}
+		oldIP := oldAddress.Addr().Unmap()
+		newIP := newAddress.Addr().Unmap()
+		if oldIP != newIP {
+			if err := networkState.EnsureEndpointRoute(newIP, config.AllowedIPs()); err != nil {
+				fmt.Fprintf(os.Stderr, "Endpoint refresh failed for Peer %d: protect route to %s: %v\n", candidate.Peer, newIP, err)
+				continue
+			}
+		}
+		uapi := fmt.Sprintf("public_key=%s\nendpoint=%s\n\n", config.Peers[peerIndex].PublicKey, candidate.Resolved)
+		if err := wgDevice.IpcSet(uapi); err != nil {
+			fmt.Fprintf(os.Stderr, "Endpoint refresh failed for Peer %d: update live peer: %v\n", candidate.Peer, err)
+			if oldIP != newIP && !endpointIPInUse(config, newIP, -1) {
+				if routeErr := networkState.RemoveEndpointRoute(newIP); routeErr != nil {
+					fmt.Fprintf(os.Stderr, "Endpoint refresh cleanup failed for %s: %v\n", newIP, routeErr)
+				}
+			}
+			continue
+		}
+		if err := config.ApplyEndpointResolution(candidate); err != nil {
+			fmt.Fprintf(os.Stderr, "Endpoint refresh state update failed for Peer %d: %v\n", candidate.Peer, err)
+		}
+		wgDevice.SendKeepalivesToPeersWithCurrentKeypair()
+		fmt.Printf("Peer %d endpoint changed [%s]: %s -> %s\n", candidate.Peer, candidate.Method, oldEndpoint, candidate.Resolved)
+		if oldIP != newIP && !endpointIPInUse(config, oldIP, -1) {
+			if err := networkState.RemoveEndpointRoute(oldIP); err != nil {
+				fmt.Fprintf(os.Stderr, "Endpoint refresh cleanup failed for %s: %v\n", oldIP, err)
+			}
+		}
+	}
+}
+
+func endpointIPInUse(config *clientcfg.Config, address netip.Addr, skipPeer int) bool {
+	for i, peer := range config.Peers {
+		if i == skipPeer || peer.Endpoint == "" {
+			continue
+		}
+		endpoint, err := netip.ParseAddrPort(peer.Endpoint)
+		if err == nil && endpoint.Addr().Unmap() == address {
+			return true
+		}
+	}
+	return false
 }
 
 func printEndpointResolutions(config *clientcfg.Config) {

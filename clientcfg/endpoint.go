@@ -74,6 +74,55 @@ func (config *Config) ResolveEndpoints() error {
 	return nil
 }
 
+// RefreshEndpointResolutions re-resolves endpoints that were originally
+// obtained through IP4P. It returns candidates without changing config, so the
+// caller can first protect the new external route and update the live device.
+func (config *Config) RefreshEndpointResolutions() ([]EndpointResolution, []error) {
+	provider, err := newTXTProvider(&config.IP4P, nil)
+	if err != nil {
+		return nil, []error{err}
+	}
+	return config.refreshEndpointResolutions(net.DefaultResolver, provider)
+}
+
+func (config *Config) refreshEndpointResolutions(resolver endpointResolver, provider txtProvider) ([]EndpointResolution, []error) {
+	var candidates []EndpointResolution
+	var lookupErrors []error
+	for _, current := range config.EndpointResolutions {
+		if current.Method == EndpointMethodStandard {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), endpointLookupTimeout)
+		endpoint, method, err := resolveEndpointDetailed(ctx, resolver, provider, current.Original)
+		cancel()
+		if err != nil {
+			lookupErrors = append(lookupErrors, fmt.Errorf("Peer %d: resolve Endpoint %q: %w", current.Peer, current.Original, err))
+			continue
+		}
+		candidates = append(candidates, EndpointResolution{
+			Peer: current.Peer, Original: current.Original, Resolved: endpoint, Method: method,
+		})
+	}
+	return candidates, lookupErrors
+}
+
+// ApplyEndpointResolution records a candidate after it has been applied to the
+// live WireGuard device.
+func (config *Config) ApplyEndpointResolution(candidate EndpointResolution) error {
+	index := candidate.Peer - 1
+	if index < 0 || index >= len(config.Peers) {
+		return fmt.Errorf("invalid peer number %d", candidate.Peer)
+	}
+	for i := range config.EndpointResolutions {
+		if config.EndpointResolutions[i].Peer == candidate.Peer {
+			config.Peers[index].Endpoint = candidate.Resolved
+			config.EndpointResolutions[i] = candidate
+			return nil
+		}
+	}
+	return fmt.Errorf("Peer %d has no endpoint resolution", candidate.Peer)
+}
+
 func resolveEndpoint(ctx context.Context, resolver endpointResolver, provider txtProvider, endpoint string) (string, error) {
 	resolved, _, err := resolveEndpointDetailed(ctx, resolver, provider, endpoint)
 	return resolved, err

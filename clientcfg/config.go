@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -33,11 +34,13 @@ type EndpointResolution struct {
 }
 
 type IP4P struct {
-	Mode      string
-	Provider  string
-	APIKey    string
-	APISecret string
-	ZoneID    string
+	Mode               string
+	Provider           string
+	APIKey             string
+	APISecret          string
+	ZoneID             string
+	RefreshInterval    uint32
+	refreshIntervalSet bool
 }
 
 type Interface struct {
@@ -239,10 +242,30 @@ func parseIP4P(config *IP4P, key, value string) error {
 		config.APISecret = value
 	case "zoneid":
 		config.ZoneID = value
+	case "refreshinterval":
+		seconds, err := strconv.ParseUint(value, 10, 32)
+		if err != nil || seconds > 86400 {
+			return fmt.Errorf("IP4P.RefreshInterval must be between 0 and 86400 seconds")
+		}
+		config.RefreshInterval = uint32(seconds)
+		config.refreshIntervalSet = true
 	default:
 		return fmt.Errorf("unknown IP4P setting %q", key)
 	}
 	return nil
+}
+
+// EndpointRefreshInterval returns the configured IP4P polling interval. IP4P
+// endpoints are refreshed every minute by default; zero explicitly disables it.
+func (config *Config) EndpointRefreshInterval() time.Duration {
+	if config.IP4P.refreshIntervalSet && config.IP4P.RefreshInterval == 0 {
+		return 0
+	}
+	seconds := config.IP4P.RefreshInterval
+	if seconds == 0 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (config *IP4P) validate() error {

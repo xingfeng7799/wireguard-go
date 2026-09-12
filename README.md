@@ -113,7 +113,7 @@ printf '%s' '203.0.113.9:51820' | base64
 printf '%s' '[2001:db8::9]:51820' | base64
 ```
 
-未启用 API 模式时，带显式端口的 Endpoint 保持原有 WireGuard 解析行为。Endpoint 会在客户端启动时解析；DNS 记录发生变化后，需要重启客户端才能获取新地址。
+未启用 API 模式时，带显式端口的 Endpoint 保持原有 WireGuard 解析行为。通过 IP4P TXT、编码 AAAA 或服务商 API 得到的 Endpoint 默认每 60 秒重新查询一次；如果 IP 或端口发生变化，客户端会动态更新运行中的 WireGuard peer，不需要重启进程。查询失败时继续使用上一次成功的 Endpoint，并在下一个周期重试。
 
 启动时会输出 Endpoint 解析模式、使用的 DNS 服务商、原始域名，以及最终解析得到的 IP 和端口。如需同时查看 WireGuard 设备的详细调试日志，可以设置 `LOG_LEVEL=debug`。
 
@@ -185,7 +185,7 @@ API 模式规则：
 
 - 域名类型的 Endpoint 只通过配置的服务商 HTTPS API 查询。
 - TXT 记录中的地址和端口会覆盖 Endpoint 中原来填写的地址和端口。
-- API 请求失败、认证失败或返回无效记录时，程序会直接报错退出。
+- 启动时 API 请求失败、认证失败或返回无效记录时，程序会直接报错退出；运行期间刷新失败则继续使用上一次成功的 Endpoint。
 - API 模式不会回退到系统 DNS TXT 或 IP4P AAAA 查询。
 - 字面量 IPv4 和 IPv6 Endpoint 不受 API 模式影响。
 
@@ -197,6 +197,16 @@ Mode = lookup_text
 ```
 
 `lookup_text` 模式不能同时配置 `Provider`、`APIKey`、`APISecret` 或 `ZoneID`。
+
+可以通过 `[IP4P]` 中的 `RefreshInterval` 调整自动刷新周期，单位为秒，最大为 86400。设置为 `0` 可关闭自动刷新：
+
+```ini
+[IP4P]
+Mode = lookup_text
+RefreshInterval = 60
+```
+
+Endpoint 变化时，程序会输出旧值、新值和解析方式。对于全流量隧道，客户端会先为新 Endpoint 建立绕过隧道的主机路由，再切换 peer，最后移除不再使用的旧主机路由。服务商 API 或 DNS 查询暂时失败不会断开当前连接。
 
 配置文件同时包含 WireGuard 私钥和 DNS 服务商 API 凭据，请严格限制文件读取权限，不要将真实密钥提交到公开仓库。
 

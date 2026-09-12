@@ -20,14 +20,21 @@ import (
 )
 
 type darwinNetworkState struct {
-	interfaceName string
-	routes        []darwinRoute
-	dns           []darwinDNSState
+	interfaceName  string
+	routes         []darwinRoute
+	dns            []darwinDNSState
+	endpointEgress map[string]darwinEgress
 }
 
 type darwinRoute struct {
-	family string
-	target string
+	family   string
+	target   string
+	endpoint bool
+}
+
+type darwinEgress struct {
+	gateway string
+	iface   string
 }
 
 type darwinDNSState struct {
@@ -36,7 +43,10 @@ type darwinDNSState struct {
 }
 
 func configureClientNetwork(interfaceName string, config *clientcfg.Config) (clientNetworkState, error) {
-	state := &darwinNetworkState{interfaceName: interfaceName}
+	state := &darwinNetworkState{
+		interfaceName:  interfaceName,
+		endpointEgress: make(map[string]darwinEgress),
+	}
 	if err := state.configureAddresses(config.Interface.Addresses, config.Interface.MTU); err != nil {
 		state.Close()
 		return nil, err
@@ -45,6 +55,7 @@ func configureClientNetwork(interfaceName string, config *clientcfg.Config) (cli
 		state.Close()
 		return nil, err
 	}
+	state.cacheMissingEndpointEgress()
 	if err := state.configureAllowedRoutes(config.AllowedIPs()); err != nil {
 		state.Close()
 		return nil, err
@@ -54,6 +65,19 @@ func configureClientNetwork(interfaceName string, config *clientcfg.Config) (cli
 		return nil, err
 	}
 	return state, nil
+}
+
+func (state *darwinNetworkState) cacheMissingEndpointEgress() {
+	for _, probe := range []netip.Addr{
+		netip.MustParseAddr("1.1.1.1"),
+		netip.MustParseAddr("2606:4700:4700::1111"),
+	} {
+		if _, ok := state.endpointEgress[routeFamily(probe)]; ok {
+			continue
+		}
+		// A missing address family is valid on hosts without that connectivity.
+		_ = state.ensureEndpointRoute(probe, nil, true)
+	}
 }
 
 func (state *darwinNetworkState) configureAddresses(addresses []netip.Prefix, mtu int) error {
@@ -80,27 +104,72 @@ func (state *darwinNetworkState) configureAddresses(addresses []netip.Prefix, mt
 func (state *darwinNetworkState) configureEndpointRoutes(endpoints []netip.Addr, allowed []netip.Prefix) error {
 	seen := make(map[netip.Addr]bool)
 	for _, endpoint := range endpoints {
-		if seen[endpoint] || !prefixesContain(allowed, endpoint) {
+		if seen[endpoint] {
 			continue
 		}
 		seen[endpoint] = true
-		family := routeFamily(endpoint)
+		if err := state.ensureEndpointRoute(endpoint, allowed, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (state *darwinNetworkState) EnsureEndpointRoute(endpoint netip.Addr, allowed []netip.Prefix) error {
+	return state.ensureEndpointRoute(endpoint.Unmap(), allowed, false)
+}
+
+func (state *darwinNetworkState) ensureEndpointRoute(endpoint netip.Addr, allowed []netip.Prefix, initial bool) error {
+	family := routeFamily(endpoint)
+	egress, ok := state.endpointEgress[family]
+	if !ok {
 		gateway, iface, err := currentDarwinRoute(endpoint)
 		if err != nil {
 			return fmt.Errorf("determine existing route for endpoint %s: %w", endpoint, err)
 		}
-		args := []string{"-q", "-n", "add", family, endpoint.String()}
-		if gateway != "" {
-			args = append(args, "-gateway", gateway)
-		} else if iface != "" {
-			args = append(args, "-interface", iface)
-		} else {
-			return fmt.Errorf("existing route for endpoint %s has no gateway or interface", endpoint)
+		if !initial && iface == state.interfaceName {
+			return fmt.Errorf("cannot determine external route for new %s endpoint after tunnel routes are active", family)
 		}
-		if err := runDarwinCommand("/sbin/route", args...); err != nil {
+		egress = darwinEgress{gateway: gateway, iface: iface}
+		state.endpointEgress[family] = egress
+	}
+	if !prefixesContain(allowed, endpoint) {
+		return nil
+	}
+	for _, route := range state.routes {
+		if route.endpoint && route.family == family && route.target == endpoint.String() {
+			return nil
+		}
+	}
+	args := []string{"-q", "-n", "add", family, endpoint.String()}
+	if egress.gateway != "" {
+		args = append(args, "-gateway", egress.gateway)
+	} else if egress.iface != "" {
+		args = append(args, "-interface", egress.iface)
+	} else {
+		return fmt.Errorf("external route for endpoint %s has no gateway or interface", endpoint)
+	}
+	if err := runDarwinCommand("/sbin/route", args...); err != nil {
+		return err
+	}
+	state.routes = append(state.routes, darwinRoute{family: family, target: endpoint.String(), endpoint: true})
+	return nil
+}
+
+func (state *darwinNetworkState) RemoveEndpointRoute(endpoint netip.Addr) error {
+	endpoint = endpoint.Unmap()
+	family := routeFamily(endpoint)
+	target := endpoint.String()
+	for i := len(state.routes) - 1; i >= 0; i-- {
+		route := state.routes[i]
+		if !route.endpoint || route.family != family || route.target != target {
+			continue
+		}
+		if err := runDarwinCommand("/sbin/route", "-q", "-n", "delete", family, target); err != nil {
 			return err
 		}
-		state.routes = append(state.routes, darwinRoute{family: family, target: endpoint.String()})
+		state.routes = append(state.routes[:i], state.routes[i+1:]...)
+		return nil
 	}
 	return nil
 }

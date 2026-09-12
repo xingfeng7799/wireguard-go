@@ -153,3 +153,33 @@ func TestIP4PAPIModeOverridesExplicitPort(t *testing.T) {
 		t.Fatalf("endpoint = %q", endpoint)
 	}
 }
+
+func TestRefreshEndpointResolutions(t *testing.T) {
+	host := "ip4p.example.com"
+	resolver := &fakeEndpointResolver{txtRecords: map[string][]string{
+		host: {base64.StdEncoding.EncodeToString([]byte("203.0.113.10:51820"))},
+	}}
+	config := &Config{
+		Peers: []Peer{{Endpoint: "203.0.113.9:51820"}, {Endpoint: "192.0.2.1:51820"}},
+		EndpointResolutions: []EndpointResolution{
+			{Peer: 1, Original: host, Resolved: "203.0.113.9:51820", Method: EndpointMethodDNSTXT},
+			{Peer: 2, Original: "vpn.example.com:51820", Resolved: "192.0.2.1:51820", Method: EndpointMethodStandard},
+		},
+	}
+	candidates, errs := config.refreshEndpointResolutions(resolver, nil)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected refresh errors: %v", errs)
+	}
+	if len(candidates) != 1 || candidates[0].Resolved != "203.0.113.10:51820" {
+		t.Fatalf("unexpected refresh candidates: %#v", candidates)
+	}
+	if config.Peers[0].Endpoint != "203.0.113.9:51820" {
+		t.Fatal("refresh mutated config before the candidate was applied")
+	}
+	if err := config.ApplyEndpointResolution(candidates[0]); err != nil {
+		t.Fatal(err)
+	}
+	if config.Peers[0].Endpoint != "203.0.113.10:51820" {
+		t.Fatalf("applied endpoint = %q", config.Peers[0].Endpoint)
+	}
+}
