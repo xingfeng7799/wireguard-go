@@ -563,7 +563,7 @@ func runPowerShell(script string) (string, error) {
 		"-NoProfile",
 		"-NonInteractive",
 		"-ExecutionPolicy", "Bypass",
-		"-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; "+script,
+		"-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "+script,
 	)
 	var output bytes.Buffer
 	command.Stdout = &output
