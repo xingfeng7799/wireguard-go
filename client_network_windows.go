@@ -149,27 +149,24 @@ func (state *windowsNetworkState) configureInterface(configuredMTU int) error {
 		"Get-NetIPInterface -InterfaceIndex %d -ErrorAction Stop | ForEach-Object { '{0}|{1}' -f $_.AddressFamily,$_.NlMtuBytes }",
 		state.interfaceIndex,
 	)
-	output, err := runPowerShell(script)
-	if err != nil {
-		return fmt.Errorf("read Windows interface settings: %w", err)
+	var interfaces []windowsIPInterfaceState
+	var lastErr error
+	for attempt := 0; attempt < 20; attempt++ {
+		output, err := runPowerShell(script)
+		if err == nil {
+			interfaces, err = parseWindowsIPInterfaceSettings(output)
+		}
+		if err == nil {
+			break
+		}
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
 	}
-	lines := outputLines(output)
-	if len(lines) == 0 {
-		return fmt.Errorf("Windows interface %d has no IP interface settings", state.interfaceIndex)
+	if len(interfaces) == 0 {
+		return fmt.Errorf("read Windows interface %d settings: %w", state.interfaceIndex, lastErr)
 	}
-	for _, line := range lines {
-		parts := strings.SplitN(line, "|", 2)
-		if len(parts) != 2 {
-			return fmt.Errorf("parse Windows interface settings %q", line)
-		}
-		oldMTU, err := strconv.Atoi(parts[1])
-		if err != nil {
-			return fmt.Errorf("parse Windows MTU %q: %w", parts[1], err)
-		}
-		family := parts[0]
-		if family != "IPv4" && family != "IPv6" {
-			return fmt.Errorf("unknown Windows address family %q", family)
-		}
+	for _, iface := range interfaces {
+		family, oldMTU := iface.family, iface.mtu
 		state.interfaces = append(state.interfaces, windowsIPInterfaceState{family: family, mtu: oldMTU})
 		setScript := fmt.Sprintf(
 			"Set-NetIPInterface -InterfaceIndex %d -AddressFamily %s -NlMtuBytes %d -PolicyStore ActiveStore -ErrorAction Stop",
@@ -180,6 +177,34 @@ func (state *windowsNetworkState) configureInterface(configuredMTU int) error {
 		}
 	}
 	return nil
+}
+
+func parseWindowsIPInterfaceSettings(output string) ([]windowsIPInterfaceState, error) {
+	lines := outputLines(output)
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("no IP interface settings returned")
+	}
+	interfaces := make([]windowsIPInterfaceState, 0, len(lines))
+	for _, line := range lines {
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("parse Windows interface settings %q", line)
+		}
+		family := strings.TrimSpace(parts[0])
+		if family != "IPv4" && family != "IPv6" {
+			return nil, fmt.Errorf("unknown Windows address family %q", family)
+		}
+		mtuText := strings.TrimSpace(parts[1])
+		oldMTU, err := strconv.Atoi(mtuText)
+		if err != nil || oldMTU <= 0 {
+			if err == nil {
+				err = fmt.Errorf("must be positive")
+			}
+			return nil, fmt.Errorf("parse Windows MTU %q for %s: %w", mtuText, family, err)
+		}
+		interfaces = append(interfaces, windowsIPInterfaceState{family: family, mtu: oldMTU})
+	}
+	return interfaces, nil
 }
 
 func (state *windowsNetworkState) configureEndpointRoutes(endpoints []netip.Addr, allowed []netip.Prefix) error {
