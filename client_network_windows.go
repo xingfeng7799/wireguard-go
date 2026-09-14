@@ -146,7 +146,7 @@ func (state *windowsNetworkState) configureInterface(configuredMTU int) error {
 		mtu = 1420
 	}
 	script := fmt.Sprintf(
-		"Get-NetIPInterface -InterfaceIndex %d -ErrorAction Stop | ForEach-Object { '{0}|{1}' -f $_.AddressFamily,$_.NlMtuBytes }",
+		"Get-NetIPInterface -InterfaceIndex %d -ErrorAction Stop | ForEach-Object { '{0}|{1}' -f $_.AddressFamily,$_.NlMtu }",
 		state.interfaceIndex,
 	)
 	var interfaces []windowsIPInterfaceState
