@@ -36,6 +36,7 @@ type windowsRoute struct {
 	interfaceIndex int
 	nextHop        string
 	endpoint       bool
+	bypass         bool
 }
 
 type windowsEgress struct {
@@ -89,6 +90,9 @@ func configureClientNetwork(interfaceName string, config *clientcfg.Config) (cli
 		return fail(err)
 	}
 	state.cacheMissingEndpointEgress()
+	if err := state.configureBypassRoutes(config.RoutingBypassPrefixes(), config.AllowedIPs()); err != nil {
+		return fail(err)
+	}
 	if err := state.configureAddresses(config.Interface.Addresses); err != nil {
 		return fail(err)
 	}
@@ -226,8 +230,9 @@ func (state *windowsNetworkState) ensureEndpointRoute(endpoint netip.Addr, allow
 		return nil
 	}
 	prefix := netip.PrefixFrom(endpoint, endpoint.BitLen()).String()
-	for _, route := range state.routes {
-		if route.endpoint && strings.EqualFold(route.destination, prefix) {
+	for i := range state.routes {
+		if strings.EqualFold(state.routes[i].destination, prefix) {
+			state.routes[i].endpoint = true
 			return nil
 		}
 	}
@@ -254,12 +259,80 @@ func (state *windowsNetworkState) RemoveEndpointRoute(endpoint netip.Addr) error
 		if !route.endpoint || !strings.EqualFold(route.destination, prefix) {
 			continue
 		}
+		state.routes[i].endpoint = false
+		if state.routes[i].bypass {
+			return nil
+		}
 		script := fmt.Sprintf(
 			"Get-NetRoute -DestinationPrefix %s -InterfaceIndex %d -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq %s } | Remove-NetRoute -Confirm:$false -ErrorAction Stop",
 			quotePowerShell(route.destination), route.interfaceIndex, quotePowerShell(route.nextHop),
 		)
 		if _, err := runPowerShell(script); err != nil {
+			state.routes[i].endpoint = true
 			return fmt.Errorf("remove Windows endpoint route %s: %w", route.destination, err)
+		}
+		state.routes = append(state.routes[:i], state.routes[i+1:]...)
+		return nil
+	}
+	return nil
+}
+
+func (state *windowsNetworkState) configureBypassRoutes(prefixes, allowed []netip.Prefix) error {
+	for _, prefix := range prefixes {
+		if err := state.EnsureBypassRoute(prefix, allowed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (state *windowsNetworkState) EnsureBypassRoute(prefix netip.Prefix, allowed []netip.Prefix) error {
+	prefix = prefix.Masked()
+	if !prefixesOverlap(allowed, prefix) {
+		return nil
+	}
+	family := windowsAddressFamily(prefix.Addr())
+	egress, ok := state.endpointEgress[family]
+	if !ok {
+		return fmt.Errorf("no external %s route is available for bypass %s", family, prefix)
+	}
+	for i := range state.routes {
+		if strings.EqualFold(state.routes[i].destination, prefix.String()) {
+			state.routes[i].bypass = true
+			return nil
+		}
+	}
+	added, err := addWindowsRoute(prefix.String(), egress.interfaceIndex, egress.nextHop)
+	if err != nil {
+		return fmt.Errorf("add Windows bypass route %s: %w", prefix, err)
+	}
+	if added {
+		state.routes = append(state.routes, windowsRoute{
+			destination: prefix.String(), interfaceIndex: egress.interfaceIndex,
+			nextHop: egress.nextHop, bypass: true,
+		})
+	}
+	return nil
+}
+
+func (state *windowsNetworkState) RemoveBypassRoute(prefix netip.Prefix) error {
+	prefix = prefix.Masked()
+	for i := len(state.routes) - 1; i >= 0; i-- {
+		route := state.routes[i]
+		if !route.bypass || !strings.EqualFold(route.destination, prefix.String()) {
+			continue
+		}
+		state.routes[i].bypass = false
+		if state.routes[i].endpoint {
+			return nil
+		}
+		script := fmt.Sprintf(
+			"Get-NetRoute -DestinationPrefix %s -InterfaceIndex %d -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq %s } | Remove-NetRoute -Confirm:$false -ErrorAction Stop",
+			quotePowerShell(route.destination), route.interfaceIndex, quotePowerShell(route.nextHop),
+		)
+		if _, err := runPowerShell(script); err != nil {
+			state.routes[i].bypass = true
+			return fmt.Errorf("remove Windows bypass route %s: %w", route.destination, err)
 		}
 		state.routes = append(state.routes[:i], state.routes[i+1:]...)
 		return nil

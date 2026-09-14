@@ -35,6 +35,7 @@ const (
 func printUsage() {
 	fmt.Printf("Usage: %s [-f/--foreground] INTERFACE-NAME\n", os.Args[0])
 	fmt.Printf("       %s -c CONFIG-FILE\n", os.Args[0])
+	fmt.Printf("       %s --check CONFIG-FILE\n", os.Args[0])
 }
 
 func warning() {
@@ -65,6 +66,13 @@ func main() {
 	}
 	if len(os.Args) == 3 && os.Args[1] == "-c" {
 		if err := runConfig(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(ExitSetupFailed)
+		}
+		return
+	}
+	if len(os.Args) == 3 && os.Args[1] == "--check" {
+		if err := checkConfig(os.Args[2]); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(ExitSetupFailed)
 		}

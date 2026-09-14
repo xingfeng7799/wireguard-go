@@ -21,6 +21,8 @@ import (
 type clientNetworkState interface {
 	EnsureEndpointRoute(netip.Addr, []netip.Prefix) error
 	RemoveEndpointRoute(netip.Addr) error
+	EnsureBypassRoute(netip.Prefix, []netip.Prefix) error
+	RemoveBypassRoute(netip.Prefix) error
 	Close() error
 }
 
@@ -28,27 +30,12 @@ func runConfig(configPath string) error {
 	if err := validateClientPlatform(); err != nil {
 		return err
 	}
-	file, err := os.Open(configPath)
+	config, err := loadClientConfig(configPath)
 	if err != nil {
-		return fmt.Errorf("open configuration: %w", err)
-	}
-	info, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return fmt.Errorf("inspect configuration: %w", err)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		fmt.Fprintf(os.Stderr, "Warning: %q is accessible by other users; use chmod 600\n", configPath)
-	}
-	config, err := clientcfg.Parse(file)
-	file.Close()
-	if err != nil {
-		return fmt.Errorf("parse configuration: %w", err)
-	}
-	if err := config.ResolveEndpoints(); err != nil {
 		return err
 	}
 	printEndpointResolutions(config)
+	printRoutingConfiguration(config)
 
 	mtu := config.Interface.MTU
 	if mtu == 0 {
@@ -88,15 +75,27 @@ func runConfig(configPath string) error {
 	fmt.Printf("WireGuard interface %s is up; press Ctrl+C to stop\n", interfaceName)
 
 	var refreshTimer *time.Ticker
-	var refresh <-chan time.Time
+	var endpointRefresh <-chan time.Time
 	if usesIP4PLookup(config.EndpointResolutions) {
 		if interval := config.EndpointRefreshInterval(); interval > 0 {
 			refreshTimer = time.NewTicker(interval)
-			refresh = refreshTimer.C
+			endpointRefresh = refreshTimer.C
 			defer refreshTimer.Stop()
 			fmt.Printf("Endpoint auto-refresh: every %s\n", interval)
 		} else {
 			fmt.Println("Endpoint auto-refresh: disabled")
+		}
+	}
+	var routingRefreshTimer *time.Ticker
+	var routingRefresh <-chan time.Time
+	if len(config.Routing.ExcludeDomains) > 0 {
+		if interval := config.RoutingRefreshInterval(); interval > 0 {
+			routingRefreshTimer = time.NewTicker(interval)
+			routingRefresh = routingRefreshTimer.C
+			defer routingRefreshTimer.Stop()
+			fmt.Printf("Routing domain auto-refresh: every %s\n", interval)
+		} else {
+			fmt.Println("Routing domain auto-refresh: disabled")
 		}
 	}
 
@@ -111,10 +110,149 @@ func runConfig(configPath string) error {
 		case <-wgDevice.Wait():
 			fmt.Printf("Stopping WireGuard interface %s\n", interfaceName)
 			return nil
-		case <-refresh:
+		case <-endpointRefresh:
 			refreshClientEndpoints(config, networkState, wgDevice)
+		case <-routingRefresh:
+			refreshRoutingDomains(config, networkState)
 		}
 	}
+}
+
+func refreshRoutingDomains(config *clientcfg.Config, networkState clientNetworkState) {
+	candidates, lookupErrors := config.RefreshRoutingDomains()
+	for _, err := range lookupErrors {
+		fmt.Fprintf(os.Stderr, "Routing domain refresh failed: %v\n", err)
+	}
+	for _, candidate := range candidates {
+		current, ok := routingDomainResolution(config, candidate.Domain)
+		if !ok || addressesEqual(current.Addresses, candidate.Addresses) {
+			continue
+		}
+		oldSet := addressSet(current.Addresses)
+		newSet := addressSet(candidate.Addresses)
+		var added []netip.Prefix
+		failed := false
+		for _, address := range candidate.Addresses {
+			if oldSet[address] {
+				continue
+			}
+			prefix := netip.PrefixFrom(address, address.BitLen())
+			if err := networkState.EnsureBypassRoute(prefix, config.AllowedIPs()); err != nil {
+				fmt.Fprintf(os.Stderr, "Routing domain refresh failed for %s: protect route to %s: %v\n", candidate.Domain, address, err)
+				failed = true
+				break
+			}
+			added = append(added, prefix)
+		}
+		if failed {
+			for _, prefix := range added {
+				if !routingAddressInUse(config, prefix.Addr(), candidate.Domain) {
+					_ = networkState.RemoveBypassRoute(prefix)
+				}
+			}
+			continue
+		}
+		if err := config.ApplyRoutingDomainResolution(candidate); err != nil {
+			fmt.Fprintf(os.Stderr, "Routing domain state update failed for %s: %v\n", candidate.Domain, err)
+			continue
+		}
+		fmt.Printf("Routing exclusion changed: %s: %s -> %s\n", candidate.Domain, joinAddresses(current.Addresses), joinAddresses(candidate.Addresses))
+		for _, address := range current.Addresses {
+			if newSet[address] || routingAddressInUse(config, address, "") {
+				continue
+			}
+			prefix := netip.PrefixFrom(address, address.BitLen())
+			if err := networkState.RemoveBypassRoute(prefix); err != nil {
+				fmt.Fprintf(os.Stderr, "Routing domain cleanup failed for %s: %v\n", address, err)
+			}
+		}
+	}
+}
+
+func routingDomainResolution(config *clientcfg.Config, domain string) (clientcfg.DomainResolution, bool) {
+	for _, resolution := range config.Routing.DomainResolutions {
+		if resolution.Domain == domain {
+			return resolution, true
+		}
+	}
+	return clientcfg.DomainResolution{}, false
+}
+
+func addressSet(addresses []netip.Addr) map[netip.Addr]bool {
+	set := make(map[netip.Addr]bool, len(addresses))
+	for _, address := range addresses {
+		set[address.Unmap()] = true
+	}
+	return set
+}
+
+func addressesEqual(left, right []netip.Addr) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	leftSet := addressSet(left)
+	for _, address := range right {
+		if !leftSet[address.Unmap()] {
+			return false
+		}
+	}
+	return true
+}
+
+func routingAddressInUse(config *clientcfg.Config, address netip.Addr, skipDomain string) bool {
+	hostPrefix := netip.PrefixFrom(address, address.BitLen())
+	for _, prefix := range config.Routing.ExcludeIPs {
+		if prefix.Masked() == hostPrefix {
+			return true
+		}
+	}
+	for _, resolution := range config.Routing.DomainResolutions {
+		if resolution.Domain == skipDomain {
+			continue
+		}
+		for _, candidate := range resolution.Addresses {
+			if candidate.Unmap() == address.Unmap() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func printRoutingConfiguration(config *clientcfg.Config) {
+	fmt.Printf("Routing mode: %s\n", config.EffectiveRoutingMode())
+	for _, prefix := range config.Routing.ExcludeIPs {
+		fmt.Printf("Routing exclusion [static]: %s\n", prefix)
+	}
+	for _, resolution := range config.Routing.DomainResolutions {
+		fmt.Printf("Routing exclusion [DNS]: %s -> %s\n", resolution.Domain, joinAddresses(resolution.Addresses))
+	}
+}
+
+func loadClientConfig(configPath string) (*clientcfg.Config, error) {
+	file, err := os.Open(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("open configuration: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect configuration: %w", err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		fmt.Fprintf(os.Stderr, "Warning: %q is accessible by other users; use chmod 600\n", configPath)
+	}
+	config, err := clientcfg.Parse(file)
+	if err != nil {
+		return nil, fmt.Errorf("parse configuration: %w", err)
+	}
+	if err := config.ResolveEndpoints(); err != nil {
+		return nil, err
+	}
+	if err := config.ResolveRoutingDomains(); err != nil {
+		return nil, err
+	}
+	return config, nil
 }
 
 func refreshClientEndpoints(config *clientcfg.Config, networkState clientNetworkState, wgDevice *device.Device) {

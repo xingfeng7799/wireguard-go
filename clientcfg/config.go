@@ -23,7 +23,22 @@ type Config struct {
 	Interface           Interface
 	Peers               []Peer
 	IP4P                IP4P
+	Routing             Routing
 	EndpointResolutions []EndpointResolution
+}
+
+type DomainResolution struct {
+	Domain    string
+	Addresses []netip.Addr
+}
+
+type Routing struct {
+	Mode               string
+	ExcludeIPs         []netip.Prefix
+	ExcludeDomains     []string
+	RefreshInterval    uint32
+	refreshIntervalSet bool
+	DomainResolutions  []DomainResolution
 }
 
 type EndpointResolution struct {
@@ -65,6 +80,7 @@ func Parse(r io.Reader) (*Config, error) {
 	peerIndex := -1
 	interfaceSeen := false
 	ip4pSeen := false
+	routingSeen := false
 	scanner := bufio.NewScanner(r)
 	for lineNumber := 1; scanner.Scan(); lineNumber++ {
 		line := strings.TrimSpace(stripComment(scanner.Text()))
@@ -87,6 +103,11 @@ func Parse(r io.Reader) (*Config, error) {
 					return nil, fmt.Errorf("line %d: duplicate IP4P section", lineNumber)
 				}
 				ip4pSeen = true
+			case "routing":
+				if routingSeen {
+					return nil, fmt.Errorf("line %d: duplicate Routing section", lineNumber)
+				}
+				routingSeen = true
 			default:
 				return nil, fmt.Errorf("line %d: unknown section %q", lineNumber, section)
 			}
@@ -111,6 +132,8 @@ func Parse(r io.Reader) (*Config, error) {
 			}
 		case "ip4p":
 			err = parseIP4P(&config.IP4P, key, value)
+		case "routing":
+			err = parseRouting(&config.Routing, key, value)
 		default:
 			err = fmt.Errorf("setting appears before a section")
 		}
@@ -139,6 +162,9 @@ func Parse(r io.Reader) (*Config, error) {
 		}
 	}
 	if err := config.IP4P.validate(); err != nil {
+		return nil, err
+	}
+	if err := config.Routing.validate(config.AllowedIPs()); err != nil {
 		return nil, err
 	}
 	return config, nil
@@ -297,6 +323,109 @@ func (config *IP4P) validate() error {
 		return fmt.Errorf("unsupported IP4P.Provider %q", config.Provider)
 	}
 	return nil
+}
+
+func parseRouting(config *Routing, key, value string) error {
+	switch key {
+	case "mode":
+		config.Mode = strings.ToLower(value)
+	case "excludeips":
+		prefixes, err := parsePrefixes(value)
+		if err != nil {
+			return fmt.Errorf("invalid Routing.ExcludeIPs: %w", err)
+		}
+		config.ExcludeIPs = append(config.ExcludeIPs, prefixes...)
+	case "excludedomains":
+		for _, domain := range splitList(value) {
+			domain = strings.TrimSuffix(strings.ToLower(domain), ".")
+			if domain == "" || strings.ContainsAny(domain, "[]:/\\ \t\r\n") {
+				return fmt.Errorf("invalid Routing.ExcludeDomains hostname %q", domain)
+			}
+			config.ExcludeDomains = append(config.ExcludeDomains, domain)
+		}
+	case "refreshinterval":
+		seconds, err := strconv.ParseUint(value, 10, 32)
+		if err != nil || seconds > 86400 {
+			return fmt.Errorf("Routing.RefreshInterval must be between 0 and 86400 seconds")
+		}
+		config.RefreshInterval = uint32(seconds)
+		config.refreshIntervalSet = true
+	default:
+		return fmt.Errorf("unknown Routing setting %q", key)
+	}
+	return nil
+}
+
+func (config *Routing) validate(allowed []netip.Prefix) error {
+	if config.Mode != "" && config.Mode != "full" && config.Mode != "split" {
+		return fmt.Errorf("Routing.Mode must be full or split, got %q", config.Mode)
+	}
+	hasDefault := false
+	for _, prefix := range allowed {
+		if prefix.Bits() == 0 {
+			hasDefault = true
+			break
+		}
+	}
+	if config.Mode == "full" && !hasDefault {
+		return fmt.Errorf("Routing.Mode full requires a default route in AllowedIPs")
+	}
+	if config.Mode == "split" && hasDefault && len(config.ExcludeIPs) == 0 && len(config.ExcludeDomains) == 0 {
+		return fmt.Errorf("Routing.Mode split with a default route requires ExcludeIPs or ExcludeDomains")
+	}
+	seenPrefixes := make(map[string]bool)
+	uniquePrefixes := config.ExcludeIPs[:0]
+	for _, prefix := range config.ExcludeIPs {
+		prefix = prefix.Masked()
+		if key := prefix.String(); !seenPrefixes[key] {
+			seenPrefixes[key] = true
+			uniquePrefixes = append(uniquePrefixes, prefix)
+		}
+	}
+	config.ExcludeIPs = uniquePrefixes
+	seenDomains := make(map[string]bool)
+	uniqueDomains := config.ExcludeDomains[:0]
+	for _, domain := range config.ExcludeDomains {
+		if !seenDomains[domain] {
+			seenDomains[domain] = true
+			uniqueDomains = append(uniqueDomains, domain)
+		}
+	}
+	config.ExcludeDomains = uniqueDomains
+	return nil
+}
+
+func (config *Config) EffectiveRoutingMode() string {
+	if config.Routing.Mode != "" {
+		return config.Routing.Mode
+	}
+	for _, prefix := range config.AllowedIPs() {
+		if prefix.Bits() == 0 {
+			return "full"
+		}
+	}
+	return "split"
+}
+
+func (config *Config) RoutingRefreshInterval() time.Duration {
+	if config.Routing.refreshIntervalSet && config.Routing.RefreshInterval == 0 {
+		return 0
+	}
+	seconds := config.Routing.RefreshInterval
+	if seconds == 0 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (config *Config) RoutingBypassPrefixes() []netip.Prefix {
+	prefixes := append([]netip.Prefix(nil), config.Routing.ExcludeIPs...)
+	for _, resolution := range config.Routing.DomainResolutions {
+		for _, address := range resolution.Addresses {
+			prefixes = append(prefixes, netip.PrefixFrom(address, address.BitLen()))
+		}
+	}
+	return prefixes
 }
 
 func parseUint16(value string) (uint16, error) {

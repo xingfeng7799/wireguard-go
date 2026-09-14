@@ -42,6 +42,18 @@ func TestSplitDefaultRoute(t *testing.T) {
 	}
 }
 
+func TestPrefixesOverlap(t *testing.T) {
+	allowed := []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("2001:db8::/32")}
+	for _, candidate := range []string{"192.168.0.0/16", "2001:db8:1::/48"} {
+		if !prefixesOverlap(allowed, netip.MustParsePrefix(candidate)) {
+			t.Fatalf("expected %s to overlap", candidate)
+		}
+	}
+	if prefixesOverlap(allowed, netip.MustParsePrefix("2001:db9::/32")) {
+		t.Fatal("unexpected IPv6 overlap")
+	}
+}
+
 func TestPrefixesContain(t *testing.T) {
 	prefixes := []netip.Prefix{
 		netip.MustParsePrefix("10.0.0.0/8"),
